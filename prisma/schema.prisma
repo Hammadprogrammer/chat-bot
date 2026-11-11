@@ -1,0 +1,239 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String?
+  passwordHash String
+  role         UserRole  @default(OWNER)
+  chatbots     Chatbot[]
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+enum UserRole {
+  ADMIN
+  OWNER
+}
+
+model Chatbot {
+  id             String  @id @default(cuid())
+  publicKey      String  @unique
+  userId         String
+  user           User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name           String
+  description    String?
+  websiteUrl     String?
+  active         Boolean @default(true)
+
+  // AI configuration
+  /// Empty string = use the server default (OPENAI_CHAT_MODEL)
+  model             String  @default("")
+  temperature       Float   @default(0.2)
+  systemPrompt      String  @default("You are a helpful assistant for this website. Answer questions using only the provided context.")
+  welcomeMessage    String  @default("Hi! How can I help you today?")
+  fallbackMessage   String  @default("I don't have that specific information at the moment, but our team will be happy to help you directly.")
+  similarityCutoff  Float   @default(0.4)
+  maxContextChunks  Int     @default(6)
+  /// Answer general / off-topic questions professionally instead of refusing
+  allowGeneralAnswers Boolean @default(true)
+  /// Owner-written training rules ("how to answer"), injected into every prompt
+  responseGuidelines  String  @default("")
+  /// Show "Sources" links under answers in the widget
+  showSources       Boolean @default(false)
+
+  // Human handoff / support
+  supportEmail   String?
+  supportUrl     String?
+  handoffEnabled Boolean @default(true)
+
+  // Branding
+  botName        String  @default("Assistant")
+  primaryColor   String  @default("#2563eb")
+  position       String  @default("right")
+  avatarUrl      String?
+  launcherText   String?
+  poweredByLabel Boolean @default(true)
+  poweredByText  String  @default("Powered by AI Chatbot")
+
+  // Security / limits (0 = unlimited)
+  allowedDomains      String[] @default([])
+  monthlyMessageLimit Int      @default(0)
+  rateLimitPerMinute  Int      @default(60)
+
+  // Data retention: conversations older than this are deleted by the daily cleanup
+  // (0 = keep forever). Usage stats, handoff leads and unanswered-question logs are kept.
+  retentionDays  Int       @default(7)
+  lastCleanupAt  DateTime?
+  unanswered     UnansweredLog[]
+
+  sources       KnowledgeSource[]
+  chunks        Chunk[]
+  conversations Conversation[]
+  handoffs      HandoffRequest[]
+  usage         UsageDaily[]
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([userId])
+}
+
+enum SourceType {
+  URL
+  FILE
+  FAQ
+  TEXT
+  GITHUB
+}
+
+enum SourceStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+model KnowledgeSource {
+  id         String       @id @default(cuid())
+  chatbotId  String
+  chatbot    Chatbot      @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  type       SourceType
+  name       String
+  url        String?
+  status     SourceStatus @default(PENDING)
+  error      String?
+  charCount  Int          @default(0)
+  chunkCount Int          @default(0)
+  pageCount  Int          @default(0)
+  /// Pending work (e.g. crawl queue, github file list) and raw payload (FAQ q/a, pasted text)
+  payload    Json?
+  /// Set while a worker is processing this source (prevents concurrent runs). Stale after 90s.
+  lockedAt   DateTime?
+  /// Set when the provider rate-limited us; processing resumes after this time.
+  pausedUntil DateTime?
+  chunks     Chunk[]
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@index([chatbotId, status])
+}
+
+model Chunk {
+  id         String                       @id @default(cuid())
+  chatbotId  String
+  chatbot    Chatbot                      @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  sourceId   String
+  source     KnowledgeSource              @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  content    String
+  title      String?
+  url        String?
+  tokenCount Int                          @default(0)
+  embedding  Unsupported("vector(1536)")?
+  createdAt  DateTime                     @default(now())
+
+  @@index([chatbotId])
+  @@index([sourceId])
+}
+
+model Conversation {
+  id               String    @id @default(cuid())
+  chatbotId        String
+  chatbot          Chatbot   @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  visitorId        String
+  pageUrl          String?
+  userAgent        String?
+  country          String?
+  messages         Message[]
+  handoffs         HandoffRequest[]
+  messageCount     Int       @default(0)
+  unansweredCount  Int       @default(0)
+  startedAt        DateTime  @default(now())
+  lastMessageAt    DateTime  @default(now())
+
+  @@index([chatbotId, lastMessageAt])
+  @@index([chatbotId, visitorId])
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           MessageRole
+  content        String
+  answered       Boolean      @default(true)
+  /// Cited chunk ids / titles / urls used for the answer
+  sources        Json?
+  inputTokens    Int          @default(0)
+  outputTokens   Int          @default(0)
+  latencyMs      Int?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+enum HandoffStatus {
+  OPEN
+  RESOLVED
+}
+
+model HandoffRequest {
+  id             String        @id @default(cuid())
+  chatbotId      String
+  chatbot        Chatbot       @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  conversationId String?
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  name           String?
+  email          String
+  message        String
+  pageUrl        String?
+  status         HandoffStatus @default(OPEN)
+  createdAt      DateTime      @default(now())
+  resolvedAt     DateTime?
+
+  @@index([chatbotId, status, createdAt])
+}
+
+/// Questions the bot could not answer — kept (compact) after conversations are cleaned up,
+/// so owners can see what to add to the knowledge base.
+model UnansweredLog {
+  id        String   @id @default(cuid())
+  chatbotId String
+  chatbot   Chatbot  @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  question  String
+  language  String?
+  createdAt DateTime @default(now())
+
+  @@index([chatbotId, createdAt])
+}
+
+/// Per-chatbot per-day aggregated usage, maintained atomically on every request.
+model UsageDaily {
+  id              String   @id @default(cuid())
+  chatbotId       String
+  chatbot         Chatbot  @relation(fields: [chatbotId], references: [id], onDelete: Cascade)
+  day             DateTime @db.Date
+  messages        Int      @default(0)
+  unanswered      Int      @default(0)
+  conversations   Int      @default(0)
+  inputTokens     Int      @default(0)
+  outputTokens    Int      @default(0)
+  embeddingTokens Int      @default(0)
+  handoffs        Int      @default(0)
+
+  @@unique([chatbotId, day])
+  @@index([chatbotId, day])
+}

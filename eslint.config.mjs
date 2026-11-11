@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Browser-only ES5 embed script, not part of the Next.js bundle.
+    "public/widget.js",
   ]),
 ]);
 
